@@ -1,0 +1,15 @@
+STATEMENT OF WORK - KESTREL RETAIL WEBSITE REDESIGN
+Studio: Northwind Studio
+Client: Kestrel Retail
+Effective: 2026-01-05
+Value: 48,000 USD
+
+Scope
+- Discovery and content audit
+- Responsive redesign of 14 templates
+- Front-end build handover
+
+Milestones
+1. Discovery sign-off - 2026-01-30
+2. Design approval - 2026-03-15
+3. Launch - 2026-05-01

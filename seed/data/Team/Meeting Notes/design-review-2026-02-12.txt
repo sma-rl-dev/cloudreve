@@ -1,0 +1,4 @@
+Design review - 2026-02-12
+Reviewed: home page, category grid, product detail
+Approved: header search placement, seasonal collection strip
+Changes requested: raise the mobile tap targets, simplify the footer links.

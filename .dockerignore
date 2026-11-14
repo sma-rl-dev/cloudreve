@@ -1,0 +1,15 @@
+# Build context for Dockerfile.tester-env.
+# The backend stage copies the whole tree; the frontend stage copies assets/.
+.git
+.gitmodules
+assets/.husky
+node_modules
+assets/node_modules
+assets/build
+assets/dev-dist
+data
+seed
+.tester-env-frontend
+*.log
+Dockerfile.tester-env
+docker-compose.tester-env.yml

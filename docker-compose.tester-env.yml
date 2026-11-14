@@ -1,0 +1,84 @@
+# tester-env compose for Cloudreve (single app container, no external services).
+#
+# Supported entry point is ./tester-env, which supplies COMPOSE_PROJECT_NAME,
+# CONTAINER_NAME, IMAGE_TAG, PORT, RUN_ID and CLIENT_URL. Direct
+# `docker compose -f docker-compose.tester-env.yml up -d` also works with the
+# defaults (port 18610, localhost origin).
+#
+# The app image is built from this checkout by Dockerfile.tester-env; the
+# upstream cloudreve/cloudreve prebuilt image and the upstream
+# docker-compose.yml (postgres + redis) are not used. The default configuration
+# needs no database service: sqlite (modernc, pure Go) at data/cloudreve.db and
+# the in-process file-backed KV store replace Postgres and Redis.
+#
+# Reset gate: every mutable file (conf.ini, cloudreve.db, uploads/, temp/,
+# avatar/, optional statics/ override) lives under the data volume mounted at
+# /cloudreve/data, so `down -v` returns a pristine install and the next deploy
+# replays the sqlite migrations plus the first-registration admin bootstrap.
+
+name: ${COMPOSE_PROJECT_NAME:-tester-env-cloudreve}
+
+services:
+  cloudreve:
+    build:
+      context: .
+      dockerfile: Dockerfile.tester-env
+      args:
+        # Keep the frontend package.json version and the backend
+        # constants.BackendVersion identical: statics.go warns when the embedded
+        # version.json disagrees with the binary version.
+        FRONTEND_VERSION: ${CLOUDREVE_VERSION:-4.19.1}
+        BACKEND_VERSION: ${CLOUDREVE_VERSION:-4.19.1}
+        LAST_COMMIT: ${CLOUDREVE_LAST_COMMIT:-a8becb9f}
+    image: ${IMAGE_TAG:-tester-env-cloudreve:dev}
+    container_name: ${CONTAINER_NAME:-tester-env-cloudreve}
+    labels:
+      tester-env.app: cloudreve
+      tester-env.run-id: "${RUN_ID:-default}"
+    environment:
+      TZ: UTC
+      # siteURL is the origin Cloudreve advertises in absolute links (share
+      # links, emails). The CLI passes TESTER_ENV_BROWSER_ORIGIN here, and
+      # inventory/migration only uses it as the *initial* DB default for a fresh
+      # volume ("Override default setting siteURL"), so an admin can still edit
+      # the setting at runtime.
+      CR_SETTING_DEFAULT_siteURL: ${CLIENT_URL:-http://localhost:18610}
+    ports:
+      - "${PORT:-18610}:5212"
+    volumes:
+      - data:/cloudreve/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5212/api/v4/site/ping"]
+      interval: 5s
+      timeout: 3s
+      start_period: 30s
+      retries: 24
+    stop_grace_period: 15s
+
+  # One-shot helper used by `./tester-env frontend`: rebuilds only the vite
+  # bundle and copies it into the data volume as data/statics, which the server
+  # prefers over the embedded assets.zip. Excluded from `up` by the profile.
+  statics:
+    profiles: ["frontend"]
+    build:
+      context: .
+      dockerfile: Dockerfile.tester-env
+      target: frontend-export
+      args:
+        FRONTEND_VERSION: ${CLOUDREVE_VERSION:-4.19.1}
+    image: ${IMAGE_TAG:-tester-env-cloudreve:dev}-frontend
+    container_name: ${CONTAINER_NAME:-tester-env-cloudreve}-statics
+    labels:
+      tester-env.app: cloudreve
+      tester-env.run-id: "${RUN_ID:-default}"
+    volumes:
+      - data:/data
+    entrypoint:
+      - /bin/sh
+      - -c
+      - rm -rf /data/statics && mkdir -p /data/statics && cp -a /build/. /data/statics/
+
+volumes:
+  # Compose scopes this to <project>_data, so RUN_ID-suffixed projects get
+  # independent data volumes and `down -v` only drops the current run's state.
+  data:

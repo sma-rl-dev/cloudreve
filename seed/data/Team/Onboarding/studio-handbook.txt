@@ -1,0 +1,4 @@
+NORTHWIND STUDIO HANDBOOK
+Working hours: 09:00-17:30, core collaboration window 10:00-15:00.
+Every client folder lives under Clients and keeps its contract in Contracts.
+Name deliverables with the project prefix and the review date.

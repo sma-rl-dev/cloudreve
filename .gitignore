@@ -38,3 +38,6 @@ tmp/
 .devcontainer/
 cloudreve
 .DS_Store
+# tester-env deterministic seed fixtures (paths are part of the app API contract)
+!seed/data/
+!seed/data/**

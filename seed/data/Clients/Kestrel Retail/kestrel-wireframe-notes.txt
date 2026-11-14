@@ -1,0 +1,5 @@
+Wireframe review - 2026-02-03
+Home page: lead with the seasonal collection, keep search visible in the header.
+Category page: three-column grid at desktop, single column below 600px.
+Product page: gallery first, size selector above the fold, reviews below.
+Open question: where the loyalty banner belongs once checkout is unchanged.

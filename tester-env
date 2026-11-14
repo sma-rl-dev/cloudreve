@@ -1,0 +1,634 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Cloudreve - Tester Environment CLI
+# Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+# Commands: deploy, seed, verify, frontend, reset, stop, logs, status, url, help
+
+RUN_ID="default"
+PORT="18610"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.tester-env.yml"
+
+# Baseline pinned by triage (status/apps/cloudreve.toml):
+#   backend  cloudreve/Cloudreve 4.19.1 = a8becb9f5b226024c83230bc52857c04966e2c30
+#   frontend cloudreve/frontend 19da0fe1ecd40971fafa813983d769fdce41573c, vendored in assets/
+VERSION="4.19.1"
+LAST_COMMIT="a8becb9f"
+
+# Deterministic bootstrap: Cloudreve has no install wizard and no user-create
+# CLI, so the deployment owns the first registration. The first registered user
+# is promoted to admin group 1; registration is open by default with no captcha
+# and no email activation.
+ADMIN_EMAIL="${CLOUDREVE_ADMIN_EMAIL:-admin@cloudreve.local}"
+ADMIN_PASSWORD="${CLOUDREVE_ADMIN_PASSWORD:-CloudreveAdmin!2026}"
+ADMIN_TOKEN=""
+
+# Deterministic business seed: a small design studio archive. Fixture bytes live
+# under seed/data (the directory tree maps 1:1 to cloudreve://my/...) and their
+# fixed modified times in seed/timestamps.tsv. Both are committed, so
+# reset -> deploy reproduces the same names, sizes and dates.
+SEED_DIR="${SCRIPT_DIR}/seed"
+SEED_DATA="${SEED_DIR}/data"
+SEED_TIMES="${SEED_DIR}/timestamps.tsv"
+
+export DOCKER_BUILDKIT=1
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+
+    CONTAINER_NAME="tester-env-cloudreve${suffix}"
+    # IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-cloudreve:dev}"
+    COMPOSE_PROJECT="${COMPOSE_PROJECT_NAME:-tester-env-cloudreve${suffix}}"
+    # siteURL advertised by the app. Browser-container friendly origin wins so
+    # absolute links (share links, emails) stay reachable from the runner.
+    CLIENT_URL="${CLIENT_URL:-${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}}"
+}
+
+compose() {
+    docker compose \
+        -p "${COMPOSE_PROJECT}" \
+        -f "${COMPOSE_FILE}" \
+        --project-directory "${SCRIPT_DIR}" \
+        "$@"
+}
+
+compose_env() {
+    COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT}" \
+    CONTAINER_NAME="${CONTAINER_NAME}" \
+    IMAGE_TAG="${IMAGE_NAME}" \
+    PORT="${PORT}" \
+    RUN_ID="${RUN_ID}" \
+    CLIENT_URL="${CLIENT_URL}" \
+    CLOUDREVE_VERSION="${VERSION}" \
+    CLOUDREVE_LAST_COMMIT="${LAST_COMMIT}" \
+    compose "$@"
+}
+
+api() {
+    # api METHOD PATH [JSON_BODY] [TOKEN]
+    local method="$1" path="$2" body="${3:-}" token="${4:-}"
+    local args=(-sS --max-time 20 -X "${method}" -H 'Accept: application/json')
+    [[ -n "${token}" ]] && args+=(-H "Authorization: Bearer ${token}")
+    if [[ -n "${body}" ]]; then
+        args+=(-H 'Content-Type: application/json' -d "${body}")
+    fi
+    curl "${args[@]}" "http://127.0.0.1:${PORT}${path}"
+}
+
+login_token() {
+    local body resp
+    body="$(printf '{"email":"%s","password":"%s"}' "${ADMIN_EMAIL}" "${ADMIN_PASSWORD}")"
+    resp="$(api POST /api/v4/session/token "${body}")" || return 1
+    jq -r '.data.token.access_token // empty' <<<"${resp}" 2>/dev/null || true
+}
+
+wait_for_health() {
+    local attempt
+    for attempt in $(seq 1 120); do
+        if curl -sf "http://127.0.0.1:${PORT}/api/v4/site/ping" >/dev/null 2>&1; then
+            echo "==> App healthy after ${attempt}s"
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "Error: app did not become healthy at http://127.0.0.1:${PORT}/" >&2
+    compose_env logs --tail 80 >&2 || true
+    exit 1
+}
+
+require_running() {
+    if ! compose_env ps --status running --format '{{.Name}}' 2>/dev/null | grep -qx "${CONTAINER_NAME}"; then
+        echo "Error: container ${CONTAINER_NAME} is not running. Run './tester-env deploy' first." >&2
+        exit 1
+    fi
+}
+
+ensure_admin() {
+    local token summary_code
+    token="$(login_token || true)"
+    if [[ -z "${token}" ]]; then
+        echo "==> Registering deterministic first user ${ADMIN_EMAIL} (promoted to admin group 1)..."
+        api POST /api/v4/user \
+            "$(printf '{"email":"%s","password":"%s","language":"en-US"}' "${ADMIN_EMAIL}" "${ADMIN_PASSWORD}")" \
+            >/dev/null
+        token="$(login_token || true)"
+    fi
+
+    if [[ -z "${token}" ]]; then
+        echo "Error: cannot log in as ${ADMIN_EMAIL} (registration may be disabled or credentials differ)." >&2
+        exit 1
+    fi
+
+    summary_code="$(api GET /api/v4/admin/summary "" "${token}" | jq -r '.code // "missing"')"
+    if [[ "${summary_code}" != "0" ]]; then
+        echo "Error: ${ADMIN_EMAIL} is not an administrator (admin summary code ${summary_code})." >&2
+        exit 1
+    fi
+    ADMIN_TOKEN="${token}"
+    echo "==> Admin ready: ${ADMIN_EMAIL} (admin API reachable)"
+}
+
+list_dir() {
+    # list_dir TOKEN URI -> listing JSON (data.files[])
+    local token="$1" uri="$2"
+    curl -sS --max-time 30 -G \
+        -H 'Accept: application/json' \
+        -H "Authorization: Bearer ${token}" \
+        --data-urlencode "uri=${uri}" \
+        --data-urlencode "page_size=100" \
+        "http://127.0.0.1:${PORT}/api/v4/file"
+}
+
+iso_to_ms() {
+    date -u -d "$1" +%s%3N
+}
+
+mime_for() {
+    case "${1##*.}" in
+        csv) echo 'text/csv' ;;
+        *) echo 'text/plain' ;;
+    esac
+}
+
+seed_folder() {
+    local token="$1" path="$2" resp code
+    resp="$(api POST /api/v4/file/create \
+        "$(printf '{"uri":"cloudreve://my/%s","type":"folder"}' "${path}")" "${token}")"
+    code="$(jq -r '.code // "missing"' <<<"${resp}" 2>/dev/null || echo missing)"
+    if [[ "${code}" != "0" ]]; then
+        echo "Error: creating seed folder '${path}' failed: ${resp}" >&2
+        exit 1
+    fi
+}
+
+seed_file() {
+    local token="$1" path="$2" iso="$3"
+    local src size body resp session code exists="" info want_ms have_ms have_size
+
+    src="${SEED_DATA}/${path}"
+    size="$(stat -c %s "${src}")"
+    want_ms="$(iso_to_ms "${iso}")"
+
+    # Re-seeding must overwrite, not duplicate: an existing file needs a new
+    # version entity, while a new file is created with the plain placeholder.
+    # Users keep up to 10 versions by default, so an unchanged file is skipped
+    # instead of versioned again; that keeps reseed idempotent (capacity and
+    # version history unchanged).
+    info="$(curl -sS --max-time 20 -G \
+        -H 'Accept: application/json' -H "Authorization: Bearer ${token}" \
+        --data-urlencode "uri=cloudreve://my/${path}" \
+        "http://127.0.0.1:${PORT}/api/v4/file/info")"
+    if [[ "$(jq -r '.code // "missing"' <<<"${info}" 2>/dev/null)" == "0" \
+        && "$(jq -r '.data.type // "missing"' <<<"${info}" 2>/dev/null)" == "0" ]]; then
+        exists=1
+        have_ms="$(jq -r '.data.updated_at' <<<"${info}")"
+        have_ms="$(( $(date -u -d "${have_ms}" +%s) * 1000 ))"
+        have_size="$(jq -r '.data.size' <<<"${info}")"
+        if [[ "${have_size}" == "${size}" && "${have_ms}" == "${want_ms}" ]]; then
+            return 0
+        fi
+    fi
+
+    body="$(printf '{"uri":"cloudreve://my/%s","size":%d,"last_modified":%d,"mime_type":"%s"' \
+        "${path}" "${size}" "${want_ms}" "$(mime_for "${src}")")"
+    [[ -n "${exists}" ]] && body+=',"entity_type":"version"'
+    body+="}"
+
+    resp="$(api PUT /api/v4/file/upload "${body}" "${token}")"
+    session="$(jq -r '.data.session_id // empty' <<<"${resp}" 2>/dev/null || true)"
+    if [[ -z "${session}" ]]; then
+        echo "Error: upload session for '${path}' failed: ${resp}" >&2
+        exit 1
+    fi
+
+    resp="$(curl -sS --max-time 60 -X POST \
+        -H "Authorization: Bearer ${token}" \
+        -H 'Content-Type: application/octet-stream' \
+        --data-binary "@${src}" \
+        "http://127.0.0.1:${PORT}/api/v4/file/upload/${session}/0")"
+    code="$(jq -r '.code // "missing"' <<<"${resp}" 2>/dev/null || echo missing)"
+    if [[ "${code}" != "0" ]]; then
+        echo "Error: uploading seed file '${path}' failed: ${resp}" >&2
+        exit 1
+    fi
+}
+
+seed_data() {
+    local token="$1" dir rel iso
+
+    [[ -d "${SEED_DATA}" && -f "${SEED_TIMES}" ]] || {
+        echo "Error: seed fixtures missing (expected ${SEED_DATA} and ${SEED_TIMES})." >&2
+        exit 1
+    }
+
+    # Folders first (find emits parents before children in sorted order).
+    while IFS= read -r dir; do
+        seed_folder "${token}" "${dir#"${SEED_DATA}/"}"
+    done < <(find "${SEED_DATA}" -mindepth 1 -type d | sort)
+
+    # Then files, with their committed fixed modified times.
+    while IFS=$'\t' read -r rel iso; do
+        [[ -n "${rel}" ]] || continue
+        if [[ ! -f "${SEED_DATA}/${rel}" ]]; then
+            echo "Error: timestamps entry without fixture: ${rel}" >&2
+            exit 1
+        fi
+        seed_file "${token}" "${rel}" "${iso}"
+    done < <(sort "${SEED_TIMES}")
+}
+
+seed_shares() {
+    local token="$1" resp names code
+
+    resp="$(api GET '/api/v4/share?page_size=50' '' "${token}")"
+    code="$(jq -r '.code // "missing"' <<<"${resp}" 2>/dev/null || echo missing)"
+    if [[ "${code}" != "0" ]]; then
+        echo "Error: listing shares before seeding failed: ${resp}" >&2
+        exit 1
+    fi
+    names="$(jq -r '.data.shares[]?.name' <<<"${resp}")"
+
+    # One folder share (public client brand assets) and one password-protected
+    # file share (freelancer brief). Skipped when the name is already present,
+    # so re-running seed never duplicates links.
+    if ! grep -qxF 'Harbor Health' <<<"${names}"; then
+        resp="$(api PUT /api/v4/share \
+            '{"uri":"cloudreve://my/Clients/Harbor Health","is_private":false}' "${token}")"
+        code="$(jq -r '.code // "missing"' <<<"${resp}" 2>/dev/null || echo missing)"
+        [[ "${code}" == "0" ]] || {
+            echo "Error: creating folder share failed: ${resp}" >&2
+            exit 1
+        }
+    fi
+
+    if ! grep -qxF 'kestrel-brief.txt' <<<"${names}"; then
+        resp="$(api PUT /api/v4/share \
+            '{"uri":"cloudreve://my/Clients/Kestrel Retail/kestrel-brief.txt","is_private":true,"password":"harbor2026"}' "${token}")"
+        code="$(jq -r '.code // "missing"' <<<"${resp}" 2>/dev/null || echo missing)"
+        [[ "${code}" == "0" ]] || {
+            echo "Error: creating file share failed: ${resp}" >&2
+            exit 1
+        }
+    fi
+}
+
+seed_summary() {
+    printf '%s folders, %s files, 2 shares in cloudreve://my\n' \
+        "$(find "${SEED_DATA}" -mindepth 1 -type d | wc -l | tr -d ' ')" \
+        "$(find "${SEED_DATA}" -mindepth 1 -type f | wc -l | tr -d ' ')"
+}
+
+
+cmd_deploy() {
+    echo "==> Building image from source: ${IMAGE_NAME}..."
+    echo "    (Cloudreve ${VERSION} @ ${LAST_COMMIT}; frontend assets/ vendored @ 19da0fe1)"
+    compose_env build cloudreve
+
+    echo "==> Starting container ${CONTAINER_NAME} on port ${PORT}..."
+    compose_env up -d --no-build
+    wait_for_health
+
+    # The documented data/statics override shadows the embedded bundle for the
+    # life of the volume. Clear it on a fresh deploy so the image's own build wins.
+    if compose_env exec -T cloudreve test -d /cloudreve/data/statics 2>/dev/null; then
+        echo "==> Removing stale data/statics override (image assets take over)..."
+        compose_env exec -T cloudreve rm -rf /cloudreve/data/statics
+        compose_env restart cloudreve >/dev/null
+        wait_for_health
+    fi
+
+    ensure_admin
+    echo "==> Seeding deterministic baseline ($(seed_summary))..."
+    seed_data "${ADMIN_TOKEN}"
+    seed_shares "${ADMIN_TOKEN}"
+
+    echo "==> Deployment complete."
+    echo "    URL:      http://localhost:${PORT}/"
+    echo "    Browser:  ${CLIENT_URL}/"
+    echo "    Login:    ${ADMIN_EMAIL} / ${ADMIN_PASSWORD}"
+}
+
+cmd_seed() {
+    require_running
+    echo "==> Seeding deterministic Northwind Studio baseline (idempotent)..."
+    ensure_admin
+    seed_data "${ADMIN_TOKEN}"
+    seed_shares "${ADMIN_TOKEN}"
+    echo "==> Seed complete: $(seed_summary)"
+}
+
+VERIFY_FAILURES=0
+
+expect_eq() {
+    local label="$1" expected="$2" actual="$3"
+    if [[ "${expected}" == "${actual}" ]]; then
+        echo "    ok: ${label}"
+        return 0
+    fi
+    echo "    FAIL: ${label}" >&2
+    diff -u <(printf '%s\n' "${expected}") <(printf '%s\n' "${actual}") \
+        | sed -e 's/^/         /' >&2 || true
+    VERIFY_FAILURES=$((VERIFY_FAILURES + 1))
+}
+
+actual_folders() {
+    list_dir "$1" "$2" | jq -r '.data.files[]? | select(.type == 1) | .name'
+}
+
+actual_files() {
+    # name|bytes|modified epoch, so RFC3339 formatting differences cannot
+    # change the comparison.
+    local token="$1" uri="$2" name size iso
+    while IFS='|' read -r name size iso; do
+        printf '%s|%s|%s\n' "${name}" "${size}" "$(date -u -d "${iso}" +%s)"
+    done < <(list_dir "${token}" "${uri}" | jq -r '.data.files[]? | select(.type == 0) | "\(.name)|\(.size)|\(.updated_at)"')
+}
+
+expected_folders_for() {
+    local parent="$1" base
+    base="${SEED_DATA}${parent:+/${parent}}"
+    find "${base}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+}
+
+expected_files_for() {
+    local parent="$1" base path name rel iso
+    base="${SEED_DATA}${parent:+/${parent}}"
+    while IFS= read -r path; do
+        name="$(basename "${path}")"
+        rel="${path#"${SEED_DATA}/"}"
+        iso="$(awk -F'\t' -v p="${rel}" '$1 == p { print $2 }' "${SEED_TIMES}")"
+        if [[ -z "${iso}" ]]; then
+            printf 'MISSING-TIMESTAMP:%s\n' "${rel}"
+            continue
+        fi
+        printf '%s|%s|%s\n' "${name}" "$(stat -c %s "${path}")" "$(date -u -d "${iso}" +%s)"
+    done < <(find "${base}" -mindepth 1 -maxdepth 1 -type f | sort)
+}
+
+check_directory() {
+    local label="$1" parent="$2" uri="$3"
+    expect_eq "${label}: folders" \
+        "$(expected_folders_for "${parent}")" \
+        "$(actual_folders "${ADMIN_TOKEN}" "${uri}" | sort)"
+    expect_eq "${label}: files (name|bytes|modified epoch)" \
+        "$(expected_files_for "${parent}")" \
+        "$(actual_files "${ADMIN_TOKEN}" "${uri}" | sort)"
+}
+
+verify_seed() {
+    local token="$1" resp names
+
+    echo "==> Verifying seeded business data..."
+
+    # Every seeded directory, so missing, renamed and duplicated records fail.
+    check_directory "my files" "" "cloudreve://my"
+    check_directory "Clients" "Clients" "cloudreve://my/Clients"
+    check_directory "Clients/Contracts" "Clients/Contracts" "cloudreve://my/Clients/Contracts"
+    check_directory "Clients/Harbor Health" "Clients/Harbor Health" "cloudreve://my/Clients/Harbor Health"
+    check_directory "Clients/Kestrel Retail" "Clients/Kestrel Retail" "cloudreve://my/Clients/Kestrel Retail"
+    check_directory "Finance" "Finance" "cloudreve://my/Finance"
+    check_directory "Finance/Invoices" "Finance/Invoices" "cloudreve://my/Finance/Invoices"
+    check_directory "Finance/Expenses" "Finance/Expenses" "cloudreve://my/Finance/Expenses"
+    check_directory "Team" "Team" "cloudreve://my/Team"
+    check_directory "Team/Meeting Notes" "Team/Meeting Notes" "cloudreve://my/Team/Meeting Notes"
+    check_directory "Team/Onboarding" "Team/Onboarding" "cloudreve://my/Team/Onboarding"
+    check_directory "Archive" "Archive" "cloudreve://my/Archive"
+
+    expect_eq "trash" "" "$(list_dir "${token}" 'cloudreve://trash' | jq -r '.data.files[]?.name' | sort)"
+
+    resp="$(api GET '/api/v4/share?page_size=50' '' "${token}")"
+    expect_eq "shares API code" "0" "$(jq -r '.code' <<<"${resp}")"
+    expect_eq "share count" "2" "$(jq -r '.data.shares | length' <<<"${resp}")"
+    expect_eq "share names" \
+        "$(printf 'Harbor Health\nkestrel-brief.txt')" \
+        "$(jq -r '[.data.shares[]?.name] | sort | .[]' <<<"${resp}")"
+    expect_eq "password-protected shares" "1" \
+        "$(jq -r '[.data.shares[]? | select(.password_protected == true)] | length' <<<"${resp}")"
+    expect_eq "folder share source type" "1" \
+        "$(jq -r '.data.shares[]? | select(.name == "Harbor Health") | .source_type' <<<"${resp}")"
+    expect_eq "file share source type" "0" \
+        "$(jq -r '.data.shares[]? | select(.name == "kestrel-brief.txt") | .source_type' <<<"${resp}")"
+
+    expect_eq "storage used (bytes)" \
+        "$(find "${SEED_DATA}" -type f -printf '%s\n' | awk '{ total += $1 } END { print total }')" \
+        "$(api GET /api/v4/user/capacity '' "${token}" | jq -r '.data.used')"
+
+    if [[ "${VERIFY_FAILURES}" -ne 0 ]]; then
+        echo "Error: ${VERIFY_FAILURES} seed verification check(s) failed." >&2
+        exit 1
+    fi
+    echo "    seed:    11 folders / 17 files with fixed sizes and modified times; 2 shares (1 password-protected)"
+}
+
+cmd_verify() {
+    require_running
+    echo "==> Verifying Cloudreve build, static assets and admin login..."
+
+    local ping version token me_code summary_code capacity_code
+    ping="$(api GET /api/v4/site/ping)"
+    if [[ "$(jq -r '.code' <<<"${ping}")" != "0" ]]; then
+        echo "Error: /api/v4/site/ping failed: ${ping}" >&2
+        exit 1
+    fi
+    version="$(jq -r '.data' <<<"${ping}")"
+    if [[ "${version}" != "${VERSION}" ]]; then
+        echo "Error: backend reports version ${version}, expected ${VERSION} (ldflags)." >&2
+        exit 1
+    fi
+    echo "    version: ${version} (constants.BackendVersion from -ldflags)"
+
+    # The SPA shell must be served (embedded assets.zip, or data/statics override).
+    if ! curl -sf "http://127.0.0.1:${PORT}/" | grep -qi '<div id="root"'; then
+        echo "Error: frontend shell is not served at http://127.0.0.1:${PORT}/" >&2
+        exit 1
+    fi
+    echo "    statics: SPA shell served at /"
+
+    token="$(login_token || true)"
+    if [[ -z "${token}" ]]; then
+        echo "Error: login failed for ${ADMIN_EMAIL}." >&2
+        exit 1
+    fi
+    ADMIN_TOKEN="${token}"
+    me_code="$(api GET /api/v4/user/me "" "${token}" | jq -r '.code')"
+    summary_code="$(api GET /api/v4/admin/summary "" "${token}" | jq -r '.code')"
+    capacity_code="$(api GET /api/v4/user/capacity "" "${token}" | jq -r '.code')"
+    if [[ "${me_code}" != "0" || "${summary_code}" != "0" || "${capacity_code}" != "0" ]]; then
+        echo "Error: authenticated probes failed (me=${me_code} admin=${summary_code} capacity=${capacity_code})." >&2
+        exit 1
+    fi
+    echo "    auth:    ${ADMIN_EMAIL} login + admin summary + capacity OK"
+
+    verify_seed "${token}"
+
+    echo "==> Verify passed."
+}
+
+cmd_frontend() {
+    require_running
+    echo "==> Rebuilding frontend only (vite) and installing it as data/statics..."
+    compose_env --profile frontend run --rm --build statics
+    echo "==> Restarting app to pick up the new static bundle..."
+    compose_env restart cloudreve >/dev/null
+    wait_for_health
+    echo "==> Frontend override active (no Go rebuild). 'deploy' clears it again."
+}
+
+cmd_reset() {
+    echo "==> Resetting environment..."
+    compose_env --profile frontend down -v --remove-orphans || true
+    echo "==> Reset complete (container and data volume removed). Run 'deploy' to start fresh."
+}
+
+cmd_stop() {
+    echo "==> Stopping container (data volume preserved)..."
+    compose_env --profile frontend stop
+}
+
+cmd_logs() {
+    compose_env logs -f --tail 100 "$@"
+}
+
+cmd_status() {
+    if compose_env ps --status running --format '{{.Name}}' 2>/dev/null | grep -qx "${CONTAINER_NAME}"; then
+        echo "Status: RUNNING"
+        echo "URL: http://localhost:${PORT}/"
+        echo "Browser URL: ${CLIENT_URL}/"
+        echo "Container: ${CONTAINER_NAME}"
+        echo "Image: ${IMAGE_NAME}"
+        echo "Login: ${ADMIN_EMAIL} / ${ADMIN_PASSWORD}"
+        if compose_env exec -T cloudreve test -d /cloudreve/data/statics 2>/dev/null; then
+            echo "Statics: data/statics override (frontend rebuild), not the embedded bundle"
+        else
+            echo "Statics: embedded assets.zip from the image build"
+        fi
+    else
+        echo "Status: NOT RUNNING"
+    fi
+}
+
+cmd_url() {
+    echo "http://localhost:${PORT}/"
+    echo "browser: ${CLIENT_URL}/"
+}
+
+cmd_help() {
+    cat <<EOF
+Cloudreve - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+  deploy    Build the image from source, start the container, bootstrap the admin, seed data
+  seed      Idempotently (re)apply the deterministic Northwind Studio seed
+  verify    Assert version, SPA shell, login, and every seeded folder/file/share
+  frontend  Rebuild only the vite bundle and serve it via the data/statics override
+  reset     Remove the container and the data volume (down -v)
+  stop      Stop the container and keep the data volume
+  logs      Follow container logs
+  status    Show whether the app is running, on which port, and which statics source
+  url       Print the host URL and the browser-visible URL
+  help      Show this help
+
+Options:
+  --run-id <id>   Isolate compose project/container/volume for parallel runs. Default: default
+  --port <port>   Host port to bind to container port 5212. Default: 18610
+
+Typical workflow:
+  ./tester-env deploy    # Build, start, bootstrap admin, seed the baseline
+  ./tester-env verify    # Check build/static/auth plus the seeded business data
+  ./tester-env reset     # Clean slate
+
+Deployment details:
+  - Baseline: 4.19.1 backend a8becb9f5b226024c83230bc52857c04966e2c30,
+    frontend 19da0fe1ecd40971fafa813983d769fdce41573c vendored into assets/
+    (the upstream assets/ submodule was replaced by the vendored tree so a
+    single parent-tree mutant patch can touch frontend code).
+  - Dockerfile.tester-env is fork-owned: node 22 + yarn 1 + vite build ->
+    assets.zip -> golang:1.26 CGO-free build with BackendVersion/LastCommit
+    ldflags -> alpine runtime. Layers are cached by BuildKit cache mounts, so a
+    backend edit rebuilds in ~1-2 min and a frontend edit needs no Go rebuild.
+  - No database, cache or worker service: sqlite (modernc, pure Go) at
+    data/cloudreve.db plus the in-process file-backed KV store are the defaults.
+  - All mutable state lives in the compose-scoped data volume mounted at
+    /cloudreve/data (conf.ini, cloudreve.db, uploads/, temp/, avatar/, statics/)
+    so reset is a single 'down -v'.
+  - Deterministic bootstrap: first registration ${ADMIN_EMAIL} /
+    ${ADMIN_PASSWORD} becomes admin (group 1). Override with
+    CLOUDREVE_ADMIN_EMAIL / CLOUDREVE_ADMIN_PASSWORD.
+  - siteURL is set from TESTER_ENV_BROWSER_ORIGIN (or http://localhost:PORT) via
+    CR_SETTING_DEFAULT_siteURL so share links stay reachable from a browser
+    container. Because it is an env override, admin edits of that setting are
+    shadowed for the container's lifetime.
+
+Environment:
+  IMAGE_TAG                  Content-addressed image tag exported by scripts/rl-env
+  TESTER_ENV_BROWSER_ORIGIN  Browser-visible origin for container browsers
+  PORT                       Host port (same as --port)
+
+Caveats:
+  - No vips/ffmpeg/libreoffice in the image: thumbnail and media-metadata
+    previews are out of scope; do not assert on them.
+  - ent hashid ids, siteID/session secret and upload storage names are random
+    per install: assert display names, counts, ordering and relationships.
+  - The service worker only registers in secure contexts, so the
+    http://host.docker.internal:<port>/ path never caches; clear site data
+    between builds if you test on a localhost-served instance.
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --run-id)
+                RUN_ID="${2:?--run-id requires a value}"
+                shift 2
+                ;;
+            --port)
+                PORT="${2:?--port requires a value}"
+                shift 2
+                ;;
+            --help|-h)
+                cmd_help
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                cmd_help
+                exit 1
+                ;;
+        esac
+    done
+
+    refresh_names
+
+    case "${cmd}" in
+        deploy|up) cmd_deploy ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        frontend) cmd_frontend ;;
+        reset) cmd_reset ;;
+        stop|down) cmd_stop ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        url) cmd_url ;;
+        help|--help|-h) cmd_help ;;
+        *)
+            echo "Unknown command: ${cmd}" >&2
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,132 @@
+# syntax=docker/dockerfile:1.7
+#
+# Cloudreve - tester-env source build (fork-owned).
+#
+# Upstream ships no source-build Dockerfile: its Dockerfile only COPYs a
+# prebuilt `cloudreve` binary from the build context. This file builds both
+# halves from the source in this checkout:
+#
+#   frontend : vendored frontend (assets/, cloudreve/frontend@19da0fe1)
+#              -> yarn install (cached) -> vite build -> assets.zip
+#   backend  : CGO-free Go build with //go:embed assets.zip + version ldflags
+#   runtime  : alpine + tzdata, single static binary, /cloudreve/data volume
+#
+# Build cost (measured cold, 2026-11-14, 28-core host):
+#   yarn install ~4 min, vite build ~3 min, go mod download ~1 min,
+#   go build ~2 min. Rebuild caching:
+#   - yarn deps are cached by a BuildKit cache mount keyed on assets/package.json
+#     + assets/yarn.lock, so frontend source edits reuse node_modules.
+#   - Go modules and the Go build cache use cache mounts too, so a backend
+#     source edit reuses compiled dependencies (modernc.org/sqlite, ent).
+#   - A frontend-only mutation does not need this file at all:
+#     `./tester-env frontend` exports the built statics and drops them into the
+#     data volume (data/statics override), so no Go rebuild happens.
+
+ARG NODE_IMAGE=node:22-bookworm
+ARG GO_IMAGE=golang:1.26
+ARG RUNTIME_IMAGE=alpine:3.22
+
+# --- Stage 1: frontend -------------------------------------------------------
+FROM ${NODE_IMAGE} AS frontend
+
+# `zip` is required because application/statics/embed.go embeds a real zip with
+# `assets/build/...` member names (the layout produced by the upstream
+# .build/build-assets.sh script: `zip -r - assets/build > assets.zip`).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends zip \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src/assets
+
+# HUSKY=0: the frontend package.json has a `prepare: husky` hook, but the build
+# context has no .git directory; disabling it keeps `yarn install` script-clean
+# without --ignore-scripts (esbuild and friends still need their postinstall).
+ENV HUSKY=0 \
+    YARN_CACHE_FOLDER=/usr/local/share/.cache/yarn
+
+# Dependency layer: only package.json/yarn.lock. yarn.lock is the authoritative
+# lockfile; package-lock.json in the frontend repo is Pro-flavoured, so `npm ci`
+# must not be used. `yarn version` runs after install so the lockfile stays valid.
+COPY assets/package.json assets/yarn.lock ./
+RUN --mount=type=cache,target=/usr/local/share/.cache/yarn \
+    --mount=type=cache,target=/usr/local/share/.cache/node/corepack \
+    yarn install --frozen-lockfile --network-timeout 1000000
+
+COPY assets/ ./
+
+# Version plumbing: the vite `generate-version` plugin writes build/version.json
+# from package.json, and application/statics/statics.go warns when that value
+# disagrees with constants.BackendVersion. Keep both sides on the same tag.
+ARG FRONTEND_VERSION=4.19.1
+RUN yarn version --new-version "${FRONTEND_VERSION}" --no-git-tag-version --ignore-scripts
+
+# Upstream build-assets.sh sets an 8 GiB heap for the heavy dependency graph
+# (excalidraw, mermaid, monaco, mapbox, pdfjs).
+ENV NODE_OPTIONS=--max-old-space-size=8192
+RUN yarn run build
+
+# Same archive layout as upstream: members must be assets/build/<file>.
+WORKDIR /src
+RUN zip -qr - assets/build > /assets.zip
+
+# Target for `./tester-env frontend`: carries just the built statics. The
+# compose `statics` service runs this image with the data volume mounted to copy
+# the fresh build into data/statics, which the server prefers over the embedded
+# zip, so a frontend-only mutation needs no Go rebuild.
+FROM ${RUNTIME_IMAGE} AS frontend-export
+COPY --from=frontend /src/assets/build /build
+
+# --- Stage 2: backend -------------------------------------------------------
+FROM ${GO_IMAGE} AS backend
+
+# GOTOOLCHAIN=local: the image already satisfies go.mod (go 1.26.0 /
+# toolchain go1.26.5), so no toolchain download is needed.
+ENV CGO_ENABLED=0 \
+    GOTOOLCHAIN=local \
+    GOFLAGS=-mod=mod
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+COPY . .
+COPY --from=frontend /assets.zip application/statics/assets.zip
+
+ARG BACKEND_VERSION=4.19.1
+ARG LAST_COMMIT=unknown
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build -trimpath -buildvcs=false \
+      -ldflags "-s -w \
+        -X 'github.com/cloudreve/Cloudreve/v4/application/constants.BackendVersion=${BACKEND_VERSION}' \
+        -X 'github.com/cloudreve/Cloudreve/v4/application/constants.LastCommit=${LAST_COMMIT}'" \
+      -o /out/cloudreve .
+
+# --- Stage 3: runtime -------------------------------------------------------
+FROM ${RUNTIME_IMAGE} AS runtime
+
+# Deliberately slimmer than upstream's image: no vips/ffmpeg/libreoffice/aria2/
+# supervisor. Those only back thumbnail/media metadata previews and the aria2
+# download relay, neither of which a tester scenario needs. Skipping them also
+# keeps preview-image endpoints out of assertions (they are disabled by default).
+RUN apk add --no-cache tzdata ca-certificates
+
+ENV TZ=UTC
+
+WORKDIR /cloudreve
+COPY --from=backend /out/cloudreve ./cloudreve
+
+# util.DataPath() resolves to <exe dir>/data, i.e. /cloudreve/data: conf.ini,
+# cloudreve.db (sqlite), uploads/, temp/, avatar/ and the optional statics
+# override all live here. Declared as a volume so `docker compose down -v`
+# returns a pristine install.
+RUN mkdir -p /cloudreve/data
+VOLUME ["/cloudreve/data"]
+
+EXPOSE 5212
+
+# "server" is upstream's default subcommand; it creates data/conf.ini with
+# [System] Listen = :5212 on first run and applies sqlite migrations to
+# data/cloudreve.db.
+ENTRYPOINT ["/cloudreve/cloudreve", "server"]

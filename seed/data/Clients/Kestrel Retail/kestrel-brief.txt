@@ -1,0 +1,14 @@
+KESTREL RETAIL - WEBSITE REDESIGN BRIEF
+Client: Kestrel Retail
+Studio: Northwind Studio
+Approved: 2026-01-12
+
+Goals
+1. Replace the 2019 storefront with a mobile-first catalogue.
+2. Surface the seasonal collection on the home page.
+3. Keep checkout on the existing payments provider.
+
+Constraints
+- Launch before the autumn campaign.
+- Product photography is supplied by the client.
+- No new analytics vendors until the privacy review closes.

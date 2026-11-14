@@ -1,0 +1,5 @@
+Harbor Health logo feedback - 2026-03-05
+
+The mark reads well at 32px but the wave detail disappears below 24px.
+Please try a simplified one-colour version for the app icon and favicon.
+The wordmark spacing is approved; keep the palette tokens unchanged.

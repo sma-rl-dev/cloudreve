@@ -1,0 +1,5 @@
+token,hex,usage
+primary,#1F4E5F,Headers and primary buttons
+accent,#E8A33D,Highlights and inline links
+surface,#F7F4EF,Page background
+ink,#1B1B1B,Body text

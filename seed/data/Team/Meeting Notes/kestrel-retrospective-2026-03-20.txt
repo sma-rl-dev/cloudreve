@@ -1,0 +1,4 @@
+Kestrel Retail retrospective - 2026-03-20
+What worked: weekly client review kept feedback short and specific.
+What did not: content migration slipped a week while photos were delayed.
+Next: freeze templates by 2026-04-10 and start the cross-browser pass.
